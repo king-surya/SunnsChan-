@@ -65,7 +65,7 @@ knowledge are recorded as evidence-backed history rather than hard-coded traits.
 Requires Python 3.11 or later. There are no third-party runtime dependencies.
 
 ```powershell
-cd "C:\Users\SURYA\Documents\Codex\2026-09-04\referenced-chatgpt-conversation-this-is-an-2\outputs\suns-chan-autonomous"
+cd "C:\Path to\suns-chan-autonomous"
 $env:PYTHONPATH="src"; python -m unittest discover -s tests -v
 python main.py --check
 python main.py --chat
