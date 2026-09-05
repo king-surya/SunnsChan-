@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.db
+.venv/
+.env
+data/
+logs/
+models/
+research/github-candidates*.json
+
+third_party/*/.git
