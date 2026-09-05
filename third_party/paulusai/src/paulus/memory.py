@@ -1,0 +1,385 @@
+"""Multi-store memory.
+
+Stores:
+  - episodic: append-only log of what happened (episodic.jsonl)
+  - semantic: durable facts (canonical in facts.json, rendered to a readable,
+    editable semantic.md). Retrieval is SEMANTIC via embeddings (vectorstore.py)
+    with an automatic keyword fallback if Chroma isn't installed.
+
+The vector index is derived; facts.json stays the source of truth, so memory
+remains inspectable and the index can always be rebuilt from it.
+
+User isolation: all public functions accept an optional *user_id* argument.
+When provided, data is stored under ``MEMORY_DIR/users/<safe_uid>/``, keeping
+each user's episodic log and facts file separate. CLI (single-user) mode
+passes ``user_id=None``, which falls back to the original global paths so
+existing installations are unaffected.
+"""
+import datetime
+import json
+import os
+import re
+import uuid
+from pathlib import Path
+
+from . import config, llm, security, vectorstore
+
+
+def _safe_uid(user_id: str) -> str:
+    return config.safe_uid(user_id)
+
+
+def _user_dir(user_id) -> Path | None:
+    if user_id is None:
+        return None
+    return config.MEMORY_DIR / "users" / _safe_uid(user_id)
+
+
+def _episodic_log(user_id=None) -> Path:
+    d = _user_dir(user_id)
+    return d / "episodic.jsonl" if d else config.EPISODIC_LOG
+
+
+def _facts_file(user_id=None) -> Path:
+    d = _user_dir(user_id)
+    return d / "facts.json" if d else config.FACTS_FILE
+
+
+def _semantic_md(user_id=None) -> Path:
+    d = _user_dir(user_id)
+    return d / "semantic.md" if d else config.SEMANTIC_MD
+
+
+def _ensure_user_dir(user_id):
+    d = _user_dir(user_id)
+    if d:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# Episodic                                                                     #
+# --------------------------------------------------------------------------- #
+
+def _tail_lines(path, n):
+    """Return up to the last *n* lines of a UTF-8 text file, reading only from
+    the end so the cost is independent of total file size (the log may be huge)."""
+    if n <= 0:
+        return []
+    block = 65536
+    data = b""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        # Walk backwards a block at a time until we've seen more than n line
+        # breaks (so the n-th line from the end is complete) or hit the start.
+        while pos > 0 and data.count(b"\n") <= n:
+            read = min(block, pos)
+            pos -= read
+            f.seek(pos)
+            data = f.read(read) + data
+    return [line.decode("utf-8") for line in data.splitlines()[-n:]]
+
+
+def _trim_episodic(path):
+    """Keep the episodic log bounded to the most recent config.MAX_EPISODES
+    entries. Reads only the tail, so even trimming a giant legacy log is cheap;
+    a slack margin keeps the rewrite rare instead of once per append."""
+    cap = config.MAX_EPISODES
+    if cap <= 0:
+        return
+    slack = max(64, cap // 5)
+    window = _tail_lines(path, cap + slack + 1)
+    if len(window) <= cap + slack:
+        return
+    keep = window[-cap:]
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def log_episode(role, text, trust="trusted", user_id=None):
+    config.ensure_dirs()
+    _ensure_user_dir(user_id)
+    path = _episodic_log(user_id)
+    rec = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "role": role, "trust": trust, "text": text,
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+    _trim_episodic(path)
+
+
+def recent_episodes(n=None, user_id=None):
+    n = n or config.RECENT_EPISODES
+    path = _episodic_log(user_id)
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in _tail_lines(path, n)]
+
+
+# --------------------------------------------------------------------------- #
+# Semantic (facts)                                                             #
+# --------------------------------------------------------------------------- #
+
+def _load_facts(user_id=None):
+    path = _facts_file(user_id)
+    if not path.exists():
+        return []
+    return _quarantine(json.loads(path.read_text(encoding="utf-8")), user_id)
+
+
+def _quarantine(records, user_id):
+    """Drop stored records that break the fact-is-a-non-empty-string invariant.
+
+    add_fact enforces that on write, so this only ever fires on data written
+    before it did. It belongs here rather than in each reader because a single
+    malformed record raised out of _keyword_search — reached from _build_system
+    on every turn — leaving the agent unable to reply to that user at all until
+    the file was hand-edited. Reading past it is what lets such an install heal
+    itself; the next save then persists the cleaned list."""
+    if not isinstance(records, list):
+        security.audit("facts_quarantined",
+                       f"{user_id}: facts file is not a list, ignoring it")
+        return []
+    good = [r for r in records
+            if isinstance(r, dict) and isinstance(r.get("fact"), str) and r["fact"].strip()]
+    if len(good) != len(records):
+        security.audit("facts_quarantined",
+                       f"{user_id}: dropped {len(records) - len(good)} malformed record(s)")
+    return good
+
+
+def semantic_text(user_id=None) -> str:
+    """The human-readable semantic-memory view (semantic.md), or a placeholder
+    when nothing has been learned yet. Used by the /memory command on the CLI
+    and the chat gateway."""
+    path = _semantic_md(user_id)
+    return (path.read_text(encoding="utf-8")
+            if path.exists() else "(no semantic memory yet)")
+
+
+def _save_facts(facts, user_id=None):
+    config.ensure_dirs()
+    _ensure_user_dir(user_id)
+    path = _facts_file(user_id)
+    path.write_text(json.dumps(facts, indent=2), encoding="utf-8")
+    _render_semantic_md(facts, _semantic_md(user_id))
+
+
+def _render_semantic_md(facts, path):
+    lines = ["# Semantic memory", "",
+             "_Auto-rendered from facts.json. What the agent currently believes._", ""]
+    for f in sorted(facts, key=lambda x: -x.get("salience", 0)):
+        prov = ", ".join(f.get("provenance", [])) or "—"
+        lines.append(
+            f"- **{f['fact']}**  "
+            f"_(confidence {f.get('confidence', 0.5):.2f}, "
+            f"salience {f.get('salience', 1.0):.2f}, source: {prov})_"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _index(fact, user_id=None):
+    if vectorstore.AVAILABLE:
+        try:
+            vectorstore.upsert(fact["id"], fact["fact"], user_id=user_id)
+        except Exception as e:
+            print(f"[memory] index upsert failed: {e}")
+
+
+def _deindex(ids, user_id=None):
+    if ids and vectorstore.AVAILABLE:
+        try:
+            vectorstore.delete(ids, user_id=user_id)
+        except Exception as e:
+            print(f"[memory] index delete failed: {e}")
+
+
+def _now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _merge_prov(existing, new):
+    out = list(existing or [])
+    for p in (new or []):
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _reinforce(f, confidence):
+    f["salience"] = min(2.0, f.get("salience", 1.0) + 0.3)
+    f["last_reinforced"] = _now()
+    f["confidence"] = max(f.get("confidence", 0.5), confidence)
+
+
+def _llm_reconcile(new_fact, candidates):
+    """Ask the model how *new_fact* relates to similar existing facts.
+    Returns {"action": "duplicate"|"contradiction"|"novel", "id": <id|None>}."""
+    numbered = "\n".join(f'(id={c["id"]}) {c["fact"]}' for c in candidates)
+    system = (
+        "You maintain durable facts about a person. Decide how the NEW fact "
+        "relates to the EXISTING facts and reply with strict JSON: "
+        '{"action": "duplicate"|"contradiction"|"novel", "id": "<existing id or null>"}. '
+        '"duplicate" = states the same information as an existing fact (a paraphrase). '
+        '"contradiction" = same subject and attribute but a different value, so the '
+        "new fact should replace it (newer info wins). "
+        '"novel" = unrelated to all existing facts. Use the matching existing id for '
+        'duplicate/contradiction, otherwise null.'
+    )
+    user = f"NEW fact:\n{new_fact}\n\nEXISTING facts:\n{numbered}"
+    # Pinned to the utility model, not routed: an internal strict-JSON job with
+    # no user waiting on it (see config.utility_model).
+    resp = llm.complete(system, [{"role": "user", "content": user}],
+                        model=config.utility_model())
+    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    # Lenient, like every other place we ask a model for JSON: strict json.loads
+    # here failed on 100% of production calls (all "Expecting value: line 1
+    # column 1", i.e. something before the JSON), and _reconcile swallows the
+    # failure by storing the fact as new — so dedup and contradiction resolution
+    # simply never happened, and paraphrases piled up. loads_json also puts an
+    # excerpt of the reply in its error, so any remaining failure says why.
+    return llm.loads_json(text)
+
+
+def _reconcile(new_fact, facts, confidence, provenance, user_id):
+    """Best-effort semantic dedup + contradiction resolution. Requires the
+    vector index (to find similar candidates) and the model (to judge the
+    relationship). Returns a result string if it handled the fact, else None so
+    the caller stores it as novel."""
+    if not vectorstore.AVAILABLE:
+        return None
+    candidates = search_facts(new_fact, k=5, user_id=user_id)
+    if not candidates:
+        return None
+    try:
+        verdict = _llm_reconcile(new_fact, candidates)
+        action = verdict.get("action")
+        target = {f["id"]: f for f in facts if "id" in f}.get(verdict.get("id"))
+    except Exception as e:
+        print(f"[memory] reconcile failed, storing as new: {e}")
+        return None
+    if target is None:
+        return None
+    if action == "duplicate":
+        _reinforce(target, confidence)
+        target["provenance"] = _merge_prov(target.get("provenance"), provenance)
+        _save_facts(facts, user_id)
+        _index(target, user_id)
+        return "reinforced existing fact"
+    if action == "contradiction":
+        target["fact"] = new_fact
+        target["confidence"] = confidence
+        target["salience"] = min(2.0, target.get("salience", 1.0) + 0.3)
+        target["last_reinforced"] = _now()
+        target["provenance"] = _merge_prov(target.get("provenance"), provenance)
+        _save_facts(facts, user_id)
+        _index(target, user_id)  # text changed -> re-embed under the same id
+        return "updated fact (newer info supersedes)"
+    return None
+
+
+def add_fact(fact, confidence=0.7, provenance=None, user_id=None):
+    # Every reader assumes a fact's text is a non-empty string, and none of them
+    # check. Enforce it at the only door in: a stored non-string used to raise
+    # AttributeError out of _keyword_search, which runs on every turn, so one
+    # bad write stopped the agent replying to that user entirely. Raising is
+    # right for both callers — tools.execute turns it into a tool error the
+    # model can retry, and consolidation counts it as a dropped entry.
+    if not isinstance(fact, str) or not fact.strip():
+        raise ValueError(f"a fact must be a non-empty string, got {type(fact).__name__}")
+    facts = _load_facts(user_id)
+    # 1. Exact (normalized) duplicate -> reinforce. Cheap; no model call.
+    for f in facts:
+        if f["fact"].strip().lower() == fact.strip().lower():
+            _reinforce(f, confidence)
+            _save_facts(facts, user_id)
+            _index(f, user_id)
+            return "reinforced existing fact"
+    # 2. Semantic dedup / contradiction resolution against similar facts.
+    result = _reconcile(fact, facts, confidence, provenance, user_id)
+    if result is not None:
+        return result
+    # 3. Genuinely new -> store it.
+    rec = {
+        "id": uuid.uuid4().hex[:12],
+        "fact": fact,
+        "confidence": confidence,
+        "salience": 1.0,
+        "provenance": provenance or ["conversation"],
+        "last_reinforced": _now(),
+    }
+    facts.append(rec)
+    _save_facts(facts, user_id)
+    _index(rec, user_id)
+    return "stored new fact"
+
+
+# ---- Retrieval: semantic first, keyword fallback -------------------------- #
+
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _keywords(text):
+    return set(_WORD.findall(text.lower()))
+
+
+def _keyword_search(query, facts, k):
+    q = _keywords(query)
+    scored = []
+    for f in facts:
+        overlap = len(q & _keywords(f["fact"]))
+        if overlap:
+            scored.append((overlap + 0.5 * f.get("salience", 1.0), f))
+    scored.sort(key=lambda x: -x[0])
+    return [f for _, f in scored[:k]]
+
+
+def _ensure_index(facts, user_id=None):
+    """Lazily (re)build the vector index from canonical facts if out of sync."""
+    if not vectorstore.AVAILABLE:
+        return
+    try:
+        if vectorstore.count(user_id) < len(facts):
+            for f in facts:
+                vectorstore.upsert(f["id"], f["fact"], user_id=user_id)
+    except Exception as e:
+        print(f"[memory] reindex failed: {e}")
+
+
+def search_facts(query, k=None, user_id=None):
+    k = k or config.TOP_FACTS
+    facts = _load_facts(user_id)
+    if not facts:
+        return []
+    by_id = {f["id"]: f for f in facts if "id" in f}
+    if vectorstore.AVAILABLE:
+        _ensure_index(facts, user_id)
+        try:
+            ids = vectorstore.query(query, k, user_id=user_id)
+            hits = [by_id[i] for i in ids if i in by_id]
+            if hits:
+                return hits
+        except Exception as e:
+            print(f"[memory] semantic query failed, falling back: {e}")
+    return _keyword_search(query, facts, k)
+
+
+# --------------------------------------------------------------------------- #
+# Consolidation                                                                #
+# --------------------------------------------------------------------------- #
+
+def decay(user_id=None):
+    """Fade salience and forget what has faded below the floor. Evicted facts
+    are dropped from facts.json (and semantic.md, via _save_facts) and from the
+    vector index. Returns the number of facts forgotten."""
+    facts = _load_facts(user_id)
+    kept, evicted = [], []
+    for f in facts:
+        f["salience"] = round(f.get("salience", 1.0) * config.DECAY_PER_SLEEP, 3)
+        target = evicted if f["salience"] < config.SALIENCE_FLOOR else kept
+        target.append(f)
+    _save_facts(kept, user_id)
+    _deindex([f["id"] for f in evicted if "id" in f], user_id)
+    return len(evicted)
